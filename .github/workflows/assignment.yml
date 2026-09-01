@@ -1,0 +1,152 @@
+name: assignment
+
+# MAGI
+# 課題 Issue が作成されたら、章ラベルに対応する正答で自動採点する。
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  grade:
+    if: contains(github.event.issue.labels.*.name, 'assignment') || startsWith(github.event.issue.title, '[課題')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Grade assignment answers
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const crypto = require('crypto');
+
+            // 正解は平文ではなく、正規化後の SHA-256 だけを保持する。
+            const answerHashes = {
+              ch01: [
+                '4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a',
+                '7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451',
+                '6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b',
+                '4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce',
+                '1bad6b8cf97131fceab8543e81f7757195fbb1d36b376ee994ad1cf17699c464',
+              ],
+              ch02: [
+                '1bad6b8cf97131fceab8543e81f7757195fbb1d36b376ee994ad1cf17699c464',
+                'ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d',
+                '1bad6b8cf97131fceab8543e81f7757195fbb1d36b376ee994ad1cf17699c464',
+                '4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce',
+                '6b51d431df5d7f141cbececcf79edf3dd861c3b4069f0b11661a3eefacbba918',
+              ],
+              ch03: [
+                '4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a',
+                '615bdd17c2556f82f384392ea8557f8cc88b03501c759e23093ab0b2a9b5cd48',
+                'd4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35',
+                'cf3bae39dd692048a8bf961182e6a34dfd323eeb0748e162eaf055107f1cb873',
+                '4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce',
+              ],
+              ch04: [
+                'ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d',
+                'cf3bae39dd692048a8bf961182e6a34dfd323eeb0748e162eaf055107f1cb873',
+                '4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a',
+                '6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b',
+                '3fdba35f04dc8c462986c992bcf875546257113072a909c162f7e470e581e278',
+              ],
+            };
+
+            function normalize(value) {
+              return String(value)
+                .replace(/[！-～]/g, (character) =>
+                  String.fromCharCode(character.charCodeAt(0) - 0xfee0)
+                )
+                .replace(/[−–—]/g, '-')
+                .replace(/[\s　]/g, '');
+            }
+
+            function sha256(value) {
+              return crypto.createHash('sha256')
+                .update(normalize(value), 'utf8')
+                .digest('hex');
+            }
+
+            const issueLabels = context.payload.issue.labels.map(({ name }) => name);
+            const chapterFromLabel = Object.keys(answerHashes)
+              .find((chapterLabel) => issueLabels.includes(chapterLabel));
+            const titleMatch = context.payload.issue.title.match(/^\[課題(0[1-4])\]/);
+            const chapter = chapterFromLabel || (titleMatch && `ch${titleMatch[1]}`);
+
+            if (!chapter) {
+              core.setFailed('課題の章ラベル（ch01〜ch04）が見つかりません。');
+              return;
+            }
+
+            const body = context.payload.issue.body || '';
+            function extract(label) {
+              const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const pattern = new RegExp(
+                '###[ \\t]*' + escaped + '[ \\t]*\\r?\\n([\\s\\S]*?)(?=\\r?\\n###[ \\t]|\\s*$)'
+              );
+              const match = body.match(pattern);
+              return match ? match[1].trim() : '';
+            }
+
+            const hashes = answerHashes[chapter];
+            let correctCount = 0;
+            const rows = hashes.map((expectedHash, index) => {
+              const label = `問${index + 1}`;
+              const answer = extract(label);
+              const correct = answer.length > 0 && sha256(answer) === expectedHash;
+              if (correct) correctCount++;
+              return `- ${label}: ${correct ? '正解' : '不正解'}`;
+            });
+
+            const score = correctCount * 4;
+            const perfect = correctCount === hashes.length;
+            const comment = [
+              '## 採点結果',
+              '',
+              ...rows,
+              '',
+              `**得点: ${score}/20**`,
+              '',
+              perfect
+                ? '満点です。'
+                : '新しい課題 Issue を作成すると再挑戦できます。',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.issue.number;
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body: comment,
+            });
+
+            const scoreLabel = `assignment-score-${score}`;
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: scoreLabel });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name: scoreLabel,
+                color: score === 20 ? '2da44e' : 'd4a72c',
+                description: `課題の得点: ${score}/20`,
+              });
+            }
+
+            await github.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number,
+              labels: [scoreLabel],
+            });
+
+            await github.rest.issues.update({
+              owner,
+              repo,
+              issue_number,
+              state: 'closed',
+            });
+# /MAGI
